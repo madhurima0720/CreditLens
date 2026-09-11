@@ -3,30 +3,62 @@ from typing import List, Dict, Any, Tuple
 import re, os
 
 DOC_TYPE_LABELS: Dict[str, str] = {
+    "aadhaar": "Aadhaar Card",
+    "pan": "PAN Card",
     "bank_statement": "Bank Statement",
-    "pay_slip":       "Salary / Pay Slip",
-    "kyc_id":         "Government ID (KYC)",
-    "kyc_addr":       "Address Proof",
-    "itr_doc":        "Form 16 / ITR Tax Return",
-    "prop_doc":       "Property Documents",
-    "veh_quote":      "Vehicle Quotation",
-    "adm_letter":     "Admission Letter",
-    "gst_cert":       "GST / Business Registration Certificate",
-    "fin_stmt":       "Audited Financial Statement",
-    "demat_stmt":     "Demat Holding Statement",
-    "pledge_doc":     "Pledge Request Form",
-    "land_rec":       "Land / 7-12 Extract",
-    "crop_rec":       "Crop Cultivation Record",
-    "gold_val":       "Gold Valuation Certificate",
-    "prop_title":     "Property Title Deeds",
-    "prod_quote":     "Product Quotation",
-    "mach_quote":     "Machinery Supplier Quotation",
-    "co_inc":         "Co-applicant Income Proof",
-    "fee_struct":     "Course Fee Structure",
-    "acad_cert":      "Academic Certificates",
+    "salary_slip": "Salary / Pay Slip",
+    "pay_slip": "Salary / Pay Slip",
+    "kyc_id": "Government ID (KYC)",
+    "kyc_addr": "Address Proof",
+    "itr_doc": "Form 16 / ITR Tax Return",
+    "prop_doc": "Property Documents",
+    "veh_quote": "Vehicle Quotation",
+    "adm_letter": "Admission Letter",
+    "gst_cert": "GST / Business Registration Certificate",
+    "fin_stmt": "Audited Financial Statement",
+    "demat_stmt": "Demat Holding Statement",
+    "pledge_doc": "Pledge Request Form",
+    "land_rec": "Land / 7-12 Extract",
+    "crop_rec": "Crop Cultivation Record",
+    "gold_val": "Gold Valuation Certificate",
+    "prop_title": "Property Title Deeds",
+    "prod_quote": "Product Quotation",
+    "mach_quote": "Machinery Supplier Quotation",
+    "co_inc": "Co-applicant Income Proof",
+    "fee_struct": "Course Fee Structure",
+    "acad_cert": "Academic Certificates",
+    "health_insurance": "Health Insurance",
+    "medical_bill": "Medical Bill",
+    "loan_statement": "Loan Statement",
+    "bank_statement": "Bank Statement",
+    "insurance_policy": "Insurance Policy",
 }
 
-IDENTITY_DOC_TYPES = {"bank_statement", "pay_slip", "kyc_id", "itr_doc", "kyc_addr"}
+DOCUMENT_TYPE_ALIASES = {
+    "aadhaar": "aadhaar",
+    "aadhaar_card": "aadhaar",
+    "pan": "pan",
+    "pan_card": "pan",
+    "bank_statement": "bank_statement",
+    "bank-statement": "bank_statement",
+    "salary_slip": "salary_slip",
+    "salary-slip": "salary_slip",
+    "pay_slip": "salary_slip",
+    "pay-slip": "salary_slip",
+    "medical_bill": "medical_bill",
+    "medical-bill": "medical_bill",
+    "health_insurance": "health_insurance",
+    "health-insurance": "health_insurance",
+    "loan_statement": "loan_statement",
+    "loan-statement": "loan_statement",
+    "kyc_id": "kyc_id",
+    "kyc-id": "kyc_id",
+    "kyc_addr": "kyc_addr",
+    "kyc-addr": "kyc_addr",
+    "kYC_ID": "kyc_id",
+}
+
+IDENTITY_DOC_TYPES = {"bank_statement", "salary_slip", "kyc_id", "itr_doc", "kyc_addr", "aadhaar", "pan", "health_insurance", "medical_bill", "loan_statement"}
 
 VALID_EXTENSIONS = {".pdf", ".jpg", ".jpeg", ".png", ".tiff", ".tif"}
 
@@ -79,16 +111,30 @@ def _classify_file(doc_type: str, file_name: str, confidence: float) -> Tuple[bo
 
     return True, ""
 
+def normalize_doc_type(doc_type: str) -> str:
+    if not doc_type:
+        return ""
+    cleaned = str(doc_type).strip().lower().replace(" ", "_").replace("-", "_")
+    if cleaned in DOCUMENT_TYPE_ALIASES:
+        return DOCUMENT_TYPE_ALIASES[cleaned]
+    cleaned = cleaned.upper().replace("-", "_")
+    for key, value in DOCUMENT_TYPE_ALIASES.items():
+        if key.upper() == cleaned:
+            return value
+    return cleaned
+
+
 def validate_upload(doc_type: str, file_name: str, confidence: float = 90.0) -> Dict[str, Any]:
-    is_valid, reason = _classify_file(doc_type, file_name, confidence)
+    normalized = normalize_doc_type(doc_type)
+    is_valid, reason = _classify_file(normalized, file_name, confidence)
     if not is_valid:
         return {
             "valid": False,
             "error": f"Provide valid document file. {reason}",
             "file_name": file_name,
-            "doc_type": doc_type,
+            "doc_type": normalized,
         }
-    return {"valid": True, "file_name": file_name, "doc_type": doc_type}
+    return {"valid": True, "file_name": file_name, "doc_type": normalized}
 
 def verify_documents(applicant_name: str, uploaded_docs: List[Dict[str, Any]]) -> Dict[str, Any]:
     cross_match_results: List[Dict[str, Any]] = []

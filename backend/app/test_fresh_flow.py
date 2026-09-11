@@ -6,7 +6,27 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from fastapi.testclient import TestClient
 from app.main import app, APPLICATIONS_DB
+from app.ocr_engine import extract_document_details
 import app.database as db_module
+
+def test_aadhaar_values_are_extracted_from_real_text():
+    sample = (
+        "Aadhaar No: 1234 5678 9012\n"
+        "Name: Ranganath Venkata\n"
+        "DOB: 15/08/1989\n"
+        "Gender: Male\n"
+        "Address: 24, Green Park Road, Bengaluru, Karnataka 560001\n"
+        "Phone: 9876543210"
+    )
+    result = extract_document_details(sample.encode("utf-8"), "aadhaar.pdf", "aadhaar")
+    fields = result["fields"]
+    assert fields["name"] == "Ranganath Venkata"
+    assert fields["dob"] == "15/08/1989"
+    assert fields["gender"] == "Male"
+    assert fields["aadhaar"] == "123456789012"
+    assert fields["phone"] == "9876543210"
+    assert "Green Park Road" in fields["address"]
+
 
 def run_e2e_test():
     print("=" * 60)

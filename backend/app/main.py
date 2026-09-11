@@ -7,7 +7,7 @@ import math
 import uuid
 import logging
 from datetime import datetime, timezone
-from app.services.document_verifier import verify_documents, validate_upload, DOC_TYPE_LABELS
+from app.services.document_verifier import verify_documents, validate_upload, DOC_TYPE_LABELS, normalize_doc_type
 from app.ocr_engine import extract_document_details, ALL_FIELDS
 import app.database as db_module
 
@@ -192,19 +192,20 @@ async def scan_document(
 
     filename_lower = filename.lower()
 
-    validation = validate_upload(document_type, filename, confidence=90.0)
+    normalized_doc_type = normalize_doc_type(document_type)
+    validation = validate_upload(normalized_doc_type, filename, confidence=90.0)
     if not validation["valid"]:
         raise HTTPException(
             status_code=422,
             detail={
                 "error": validation["error"],
                 "file_name": filename,
-                "doc_type": document_type,
+                "doc_type": normalized_doc_type,
                 "badge": "INVALID_DOCUMENT",
             }
         )
 
-    extraction = extract_document_details(content, filename, document_type or "")
+    extraction = extract_document_details(content, filename, normalized_doc_type or "")
     fields = extraction["fields"]
 
     extracted_data = {

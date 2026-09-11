@@ -174,9 +174,9 @@ export default function AssessmentWizard({ onNavigateTab, userRole }) {
           }));
         }
         setExtractedDetails((prev) => {
-          const updated = { ...prev };
+          const updated = { ...DEFAULT_EXTRACTED_DETAILS, ...prev };
           Object.entries(incomingExtracted).forEach(([k, v]) => {
-            if (v && v !== 'Not Found') {
+            if (v && v !== 'Not Found' && (updated[k] === 'Not Found' || !updated[k] || updated[k] === '' || updated[k] === null)) {
               updated[k] = v;
             }
           });

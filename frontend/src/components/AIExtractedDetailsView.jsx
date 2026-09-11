@@ -9,6 +9,7 @@ import {
 export const DEFAULT_EXTRACTED_DETAILS = {
   name: 'Not Found',
   dob: 'Not Found',
+  gender: 'Not Found',
   aadhaar: 'Not Found',
   pan: 'Not Found',
   phone: 'Not Found',
@@ -63,6 +64,7 @@ export default function AIExtractedDetailsView({ details = {}, title = "AI Extra
       fields: [
         { key: "name", label: "Applicant Name", icon: User },
         { key: "dob", label: "Date of Birth (DOB)", icon: Calendar },
+        { key: "gender", label: "Gender", icon: User },
         { key: "aadhaar", label: "Aadhaar Number", icon: CreditCard },
         { key: "pan", label: "PAN Identifier", icon: CreditCard },
         { key: "phone", label: "Phone Number", icon: Phone },

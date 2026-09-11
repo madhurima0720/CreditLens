@@ -1,11 +1,23 @@
 import io
+import json
+import os
 import re
 from typing import Dict, Any, Optional
+
 import pypdf
+import requests
+from PIL import Image, ImageOps
+import pytesseract
+
+try:
+    from pdf2image import convert_from_bytes
+except Exception:  # pragma: no cover
+    convert_from_bytes = None
 
 ALL_FIELDS = [
     "name",
     "dob",
+    "gender",
     "aadhaar",
     "pan",
     "phone",
@@ -27,16 +39,63 @@ ALL_FIELDS = [
     "collateral",
 ]
 
-def extract_text_from_bytes(file_bytes: bytes, filename: str) -> str:
+
+def _clean_text(value: Optional[str]) -> str:
+    if value is None:
+        return ""
+    return re.sub(r"\s+", " ", str(value)).strip()
+
+
+def _normalize_numeric_digits(value: str) -> str:
+    digits = re.sub(r"\D+", "", value or "")
+    return digits
+
+
+def _extract_json_payload(text: str) -> Optional[Dict[str, Any]]:
+    if not text:
+        return None
+    try:
+        start = text.find("{")
+        end = text.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            candidate = text[start:end + 1]
+            return json.loads(candidate)
+    except Exception:
+        pass
+    try:
+        return json.loads(text)
+    except Exception:
+        return None
+
+
+def extract_text_from_bytes(file_bytes: bytes, filename: str, doc_type: str = "") -> str:
     fn_lower = filename.lower()
     text = ""
+
     if fn_lower.endswith(".pdf"):
         try:
             reader = pypdf.PdfReader(io.BytesIO(file_bytes))
             for page in reader.pages:
-                extracted = page.extract_text()
+                extracted = page.extract_text() or ""
                 if extracted:
                     text += extracted + "\n"
+        except Exception:
+            pass
+
+    if not text.strip() and fn_lower.endswith(".pdf") and convert_from_bytes:
+        try:
+            pages = convert_from_bytes(file_bytes)
+            for page in pages:
+                page = ImageOps.grayscale(page)
+                text += pytesseract.image_to_string(page) + "\n"
+        except Exception:
+            pass
+
+    if not text.strip() and fn_lower.endswith((".png", ".jpg", ".jpeg", ".tif", ".tiff")):
+        try:
+            image = Image.open(io.BytesIO(file_bytes))
+            image = ImageOps.grayscale(image)
+            text = pytesseract.image_to_string(image)
         except Exception:
             pass
 
@@ -56,59 +115,141 @@ def extract_text_from_bytes(file_bytes: bytes, filename: str) -> str:
         except Exception:
             pass
 
-    return text
+    if not text.strip():
+        try:
+            import subprocess
+            if os.name == "nt":
+                import tempfile
+                with tempfile.NamedTemporaryFile(suffix=os.path.splitext(filename)[1] or ".png", delete=False) as tmp:
+                    tmp.write(file_bytes)
+                    tmp_path = tmp.name
+                try:
+                    text = subprocess.check_output(['tesseract', tmp_path, 'stdout'], stderr=subprocess.DEVNULL, text=True)
+                except Exception:
+                    text = ""
+                finally:
+                    try:
+                        os.unlink(tmp_path)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+    return _clean_text(text)
+
+
+def _first_match(patterns, text: str, flags: int = 0) -> Optional[str]:
+    for pattern in patterns:
+        match = re.search(pattern, text, flags)
+        if match:
+            return _clean_text(match.group(1))
+    return None
+
+
+def _candidate_name(text: str) -> Optional[str]:
+    lines = [line.strip() for line in text.replace("\r", "\n").split("\n") if line.strip()]
+    label_patterns = [
+        "Applicant Name", "Customer Name", "Cardholder Name", "Policyholder Name",
+        "Account Holder", "Name of Applicant", "Name"
+    ]
+    for line in lines:
+        for label in label_patterns:
+            if line.lower().startswith(label.lower()):
+                remainder = line[len(label):].lstrip(":- ")
+                remainder = re.split(r"\s+(?:DOB|Date of Birth|D\.O\.B|Gender|Address|Mobile|Phone|PAN|Aadhaar|UID|Email)\b", remainder, flags=re.IGNORECASE)[0].strip()
+                if len(remainder) > 2 and not re.search(r"\b(statement|bank|invoice|receipt|limited|pvt|private|company|corporation)\b", remainder, re.IGNORECASE):
+                    return remainder
+
+    patterns = [
+        r"(?:Applicant Name|Customer Name|Cardholder Name|Policyholder Name|Account Holder|Name of Applicant|Name)[\s:]+([A-Z][A-Za-z.\s]{2,60})(?=\s*(?:DOB|Date of Birth|D\.O\.B|Gender|Address|Mobile|Phone|PAN|Aadhaar|UID|Email|Token|$))",
+        r"(?:Mr\.|Ms\.|Mrs\.)\s*([A-Z][A-Za-z.\s]{2,60})(?=\s*(?:DOB|Date of Birth|D\.O\.B|Gender|Address|Mobile|Phone|PAN|Aadhaar|UID|Email|[A-Z]{2,}|$))",
+        r"\b([A-Z][a-z]+(?:\s[A-Z][a-z]+){1,5})\b",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            candidate = _clean_text(match.group(1))
+            candidate = re.split(r"\s+(?:DOB|Date of Birth|D\.O\.B|Gender|Address|Mobile|Phone|PAN|Aadhaar|UID|Email)\b", candidate, flags=re.IGNORECASE)[0].strip()
+            if len(candidate) > 2 and not re.search(r"\b(statement|bank|invoice|receipt|limited|pvt|private|company|corporation)\b", candidate, re.IGNORECASE):
+                return candidate
+    return None
+
+
+def _trim_contact_tail(value: Optional[str]) -> Optional[str]:
+    if not value:
+        return value
+    cleaned = re.split(r"\s+(?:Phone|Mobile|Contact|Tel|Email)\b", value, flags=re.IGNORECASE)[0].strip()
+    return cleaned if cleaned else value
+
 
 def extract_field_values(raw_text: str, filename: str = "", doc_type: str = "") -> Dict[str, str]:
     res: Dict[str, str] = {field: "Not Found" for field in ALL_FIELDS}
     if not raw_text or not raw_text.strip():
         return res
 
-    text = raw_text
+    text = raw_text.replace("\r", "\n")
+    doc_label = (doc_type or filename or "").lower()
 
-    # 1. PAN: 5 uppercase letters, 4 digits, 1 uppercase letter
     pan_match = re.search(r"\b([A-Z]{5}[0-9]{4}[A-Z])\b", text)
     if pan_match:
         res["pan"] = pan_match.group(1)
+    else:
+        pan_alt = _first_match([r"(?:PAN|Permanent Account Number)[\s:]*([A-Z]{5}[0-9]{4}[A-Z])", r"\b([A-Z]{5}[0-9]{4}[A-Z])\b"], text, re.IGNORECASE)
+        if pan_alt:
+            res["pan"] = pan_alt
 
-    # 2. Aadhaar: 12 digits (often 4 4 4)
-    aadhaar_match = re.search(r"\b(\d{4}\s\d{4}\s\d{4})\b", text)
-    if not aadhaar_match:
-        aadhaar_match = re.search(r"\b(?:Aadhaar|UID|UIDAI)[\s:]*(\d{12})\b", text, re.IGNORECASE)
-    if aadhaar_match:
-        res["aadhaar"] = aadhaar_match.group(1)
+    aadhaar_digits = _first_match([
+        r"(?:Aadhaar|UID|UIDAI|Aadhaar No\.?|Aadhaar Number)[\s:]*([0-9]{12})",
+        r"\b([0-9]{4}\s[0-9]{4}\s[0-9]{4})\b",
+        r"\b([0-9]{12})\b",
+    ], text, re.IGNORECASE)
+    if aadhaar_digits:
+        clean_aadhaar = re.sub(r"\D+", "", aadhaar_digits)
+        if len(clean_aadhaar) == 12:
+            res["aadhaar"] = clean_aadhaar
 
-    # 3. Email
-    email_match = re.search(r"\b([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,})\b", text)
-    if email_match:
-        res["email"] = email_match.group(1)
-
-    # 4. Phone
-    phone_match = re.search(r"\b(?:Phone|Mobile|Contact|Tel)[\s:]*(?:(?:\+91|91)[\-\s]?)?([6-9]\d{9})\b", text, re.IGNORECASE)
-    if not phone_match:
-        phone_match = re.search(r"\b(?:\+91[\-\s]?)?([6-9]\d{9})\b", text)
-    if phone_match:
-        res["phone"] = phone_match.group(1)
-
-    # 5. DOB
-    dob_match = re.search(r"\b(?:DOB|Date of Birth|Birth Date)[\s:]*([0-3]?\d[\/\-\.][0-1]?\d[\/\-\.]\d{4})\b", text, re.IGNORECASE)
-    if not dob_match:
-        dob_match = re.search(r"\b(?:Born|DOB)[\s:]*([A-Za-z]+\s\d{1,2},?\s\d{4})\b", text, re.IGNORECASE)
+    dob_match = _first_match([
+        r"(?:DOB|Date of Birth|D\.O\.B|Birth Date)[\s:]*([0-3]?\d[\/\-\.][0-1]?\d[\/\-\.]\d{4})",
+        r"(?:DOB|Date of Birth)[\s:]*([A-Za-z]+\s\d{1,2},?\s\d{4})",
+        r"\b([0-3]?\d[\/\-\.][0-1]?\d[\/\-\.]\d{4})\b",
+    ], text, re.IGNORECASE)
     if dob_match:
-        res["dob"] = dob_match.group(1).strip()
+        res["dob"] = dob_match
 
-    # 6. Name
-    name_match = re.search(r"\b(?:Applicant Name|Account Holder|Customer Name|Employee Name|Taxpayer Name|Name)[\s:]+([A-Za-z\s.]{3,35})(?=\n|$|,|;|\t)", text, re.IGNORECASE)
+    gender_match = _first_match([
+        r"(?:Gender|Sex)[\s:]*([A-Za-z]+)",
+    ], text, re.IGNORECASE)
+    if gender_match:
+        gender = gender_match.strip()
+        normalized = gender.lower()
+        if normalized in {"male", "female", "transgender", "other"}:
+            res["gender"] = gender.capitalize()
+
+    name_match = _candidate_name(text)
     if name_match:
-        clean_name = name_match.group(1).strip()
-        if len(clean_name) > 2 and not any(k in clean_name.lower() for k in ["statement", "bank", "invoice", "receipt", "limited", "pvt"]):
-            res["name"] = clean_name
+        res["name"] = name_match
 
-    # 7. Address
-    addr_match = re.search(r"\b(?:Address|Current Address|Permanent Address|Residing at)[\s:]+([^\n\r]{10,120})", text, re.IGNORECASE)
-    if addr_match:
-        res["address"] = addr_match.group(1).strip()
+    address_match = _first_match([
+        r"(?:Address|Current Address|Permanent Address|Residential Address|Communication Address)[\s:]+([^\n]{20,200})",
+        r"(?:(?:House|Flat|Building|Street|Road|Village|Town|City|State|Pin|Pincode).{15,180})",
+    ], text, re.IGNORECASE)
+    if address_match:
+        address = _trim_contact_tail(address_match)
+        if address:
+            res["address"] = address
 
-    # 8. Loan Type
+    email_match = _first_match([r"\b([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})\b"], text)
+    if email_match:
+        res["email"] = email_match
+
+    phone_match = _first_match([
+        r"(?:Phone|Mobile|Contact|Tel)[\s:]*\+?91[\s\-]?([6-9]\d{9})",
+        r"(?:Phone|Mobile|Contact|Tel)[\s:]*([6-9]\d{9})",
+        r"\b(?:\+?91[\s\-]?)?([6-9]\d{9})\b",
+    ], text, re.IGNORECASE)
+    if phone_match:
+        res["phone"] = phone_match
+
     loan_types = [
         "Home Loan", "Vehicle Loan", "Education Loan", "Personal Loan",
         "Business Loan", "Agricultural Loan", "Gold Loan", "Loan Against Property",
@@ -119,94 +260,63 @@ def extract_field_values(raw_text: str, filename: str = "", doc_type: str = "") 
             res["loan_type"] = lt
             break
 
-    # 9. Loan Amount
-    amount_match = re.search(r"\b(?:Loan Amount|Sanctioned Amount|Principal Amount|Requested Loan)[\s:]*(?:Rs\.?|INR|₹)?\s*([\d,]+(?:\.\d{2})?)", text, re.IGNORECASE)
-    if amount_match:
-        res["loan_amount"] = f"₹{amount_match.group(1).strip()}"
+    loan_amount_match = _first_match([
+        r"(?:Loan Amount|Sanctioned Amount|Principal Amount|Requested Loan)[\s:]*[\-:]*\s*(?:Rs\.?|INR|₹)?\s*([\d,]+(?:\.\d{2})?)",
+        r"(?:Amount\s+Sanctioned|Sanctioned\s+Amount)[\s:]*[\-:]*\s*(?:Rs\.?|INR|₹)?\s*([\d,]+(?:\.\d{2})?)",
+    ], text, re.IGNORECASE)
+    if loan_amount_match:
+        res["loan_amount"] = f"₹{loan_amount_match}"
 
-    # 10. Interest Rate
-    roi_match = re.search(r"\b(?:Interest Rate|Rate of Interest|ROI|Annual Interest)[\s:]*([\d.]+\s*%)", text, re.IGNORECASE)
-    if not roi_match:
-        roi_match = re.search(r"\b([\d.]+)%\s*(?:p\.a\.|per annum|interest)", text, re.IGNORECASE)
+    roi_match = _first_match([
+        r"(?:Interest Rate|Rate of Interest|ROI|Annual Interest)[\s:]*([\d.]+\s*%)",
+        r"\b([\d.]+)%\s*(?:p\.a\.|per annum|interest)",
+    ], text, re.IGNORECASE)
     if roi_match:
-        res["interest_rate"] = roi_match.group(1).strip() if "%" in roi_match.group(1) else f"{roi_match.group(1).strip()}%"
+        res["interest_rate"] = roi_match if "%" in roi_match else f"{roi_match}%"
 
-    # 11. Tenure
-    tenure_match = re.search(r"\b(?:Tenure|Term|Loan Duration|Repayment Period)[\s:]*(\d+\s*(?:months?|years?|yrs?|mths?))", text, re.IGNORECASE)
+    tenure_match = _first_match([
+        r"(?:Tenure|Term|Loan Duration|Repayment Period)[\s:]*([\d]+\s*(?:months?|years?|yrs?|mths?))",
+    ], text, re.IGNORECASE)
     if tenure_match:
-        res["tenure"] = tenure_match.group(1).strip()
+        res["tenure"] = tenure_match
 
-    # 12. EMI
-    emi_match = re.search(r"\b(?:EMI|Monthly Installment|Installment Amount)[\s:]*(?:Rs\.?|INR|₹)?\s*([\d,]+(?:\.\d{2})?)", text, re.IGNORECASE)
+    emi_match = _first_match([
+        r"(?:EMI|Monthly Installment|Installment Amount)[\s:]*[\-:]*\s*(?:Rs\.?|INR|₹)?\s*([\d,]+(?:\.\d{2})?)",
+    ], text, re.IGNORECASE)
     if emi_match:
-        res["emi"] = f"₹{emi_match.group(1).strip()}"
+        res["emi"] = f"₹{emi_match}"
 
-    # 13. Loan Account Number
-    lan_match = re.search(r"\b(?:Loan Account Number|Loan A\/c No\.?|LAN|Loan Ref No\.?|Loan No\.?)[\s:]*([A-Za-z0-9\-]{6,20})\b", text, re.IGNORECASE)
-    if lan_match:
-        res["loan_account_number"] = lan_match.group(1).strip()
+    account_match = _first_match([
+        r"(?:Loan Account Number|Loan A/c No\.?|LAN|Loan Ref No\.?|Loan No\.?)[\s:]*([A-Za-z0-9\-]{6,20})",
+    ], text, re.IGNORECASE)
+    if account_match:
+        res["loan_account_number"] = account_match
 
-    # 14. Dates
-    dates_match = re.search(r"\b(?:Sanction Date|Agreement Date|Disbursal Date|Statement Date|Issue Date|Date)[\s:]*([0-3]?\d[\/\-\.][0-1]?\d[\/\-\.]\d{4})\b", text, re.IGNORECASE)
+    dates_match = _first_match([
+        r"(?:Sanction Date|Agreement Date|Disbursal Date|Statement Date|Issue Date|Date)[\s:]*([0-3]?\d[\/\-\.][0-1]?\d[\/\-\.]\d{4})",
+    ], text, re.IGNORECASE)
     if dates_match:
-        res["dates"] = dates_match.group(1).strip()
+        res["dates"] = dates_match
 
-    # 15. Outstanding Amount
-    out_match = re.search(r"\b(?:Outstanding Amount|Outstanding Balance|Principal Outstanding|Current Balance|Closing Balance)[\s:]*(?:Rs\.?|INR|₹)?\s*([\d,]+(?:\.\d{2})?)", text, re.IGNORECASE)
-    if out_match:
-        res["outstanding_amount"] = f"₹{out_match.group(1).strip()}"
+    outstanding_match = _first_match([
+        r"(?:Outstanding Amount|Outstanding Balance|Principal Outstanding|Current Balance|Closing Balance)[\s:]*[\-:]*\s*(?:Rs\.?|INR|₹)?\s*([\d,]+(?:\.\d{2})?)",
+    ], text, re.IGNORECASE)
+    if outstanding_match:
+        res["outstanding_amount"] = f"₹{outstanding_match}"
 
-    # 16. Income
-    inc_match = re.search(r"\b(?:Gross Salary|Net Salary|Monthly Income|Gross Income|Verified Income|Basic Pay|Total Earnings)[\s:]*(?:Rs\.?|INR|₹)?\s*([\d,]+(?:\.\d{2})?)", text, re.IGNORECASE)
-    if inc_match:
-        res["income"] = f"₹{inc_match.group(1).strip()}"
-
-    # 17. Existing Loans/EMIs
-    exist_match = re.search(r"\b(?:Existing Loans?|Existing EMIs?|Other Running Loans?|Active Borrowings)[\s:]*([^\n\r,;]{3,80})", text, re.IGNORECASE)
-    if exist_match:
-        res["existing_loans_emis"] = exist_match.group(1).strip()
-
-    # 18. Bank Details
-    bank_name = None
-    known_banks = ["HDFC Bank", "State Bank of India", "SBI", "ICICI Bank", "Axis Bank", "Kotak Mahindra Bank", "Punjab National Bank", "Bank of Baroda", "Canara Bank"]
-    for b in known_banks:
-        if re.search(r"\b" + re.escape(b) + r"\b", text, re.IGNORECASE):
-            bank_name = b
-            break
-    ifsc_match = re.search(r"\b([A-Z]{4}0[A-Z0-9]{6})\b", text)
-    acct_match = re.search(r"\b(?:A\/C|Account No\.?|Acc No\.?)[\s:]*([0-9]{9,18})\b", text, re.IGNORECASE)
-
-    bank_parts = []
-    if bank_name:
-        bank_parts.append(bank_name)
-    if acct_match:
-        bank_parts.append(f"A/C: {acct_match.group(1)}")
-    if ifsc_match:
-        bank_parts.append(f"IFSC: {ifsc_match.group(1)}")
-    if bank_parts:
-        res["bank_details"] = " | ".join(bank_parts)
-
-    # 19. Assets
-    asset_match = re.search(r"\b(?:Assets?|Total Assets|Property Valuation|Gold Weight|Vehicle Value|Securities Value)[\s:]*([^\n\r,;]{3,80})", text, re.IGNORECASE)
-    if asset_match:
-        res["assets"] = asset_match.group(1).strip()
-
-    # 20. Liabilities
-    liab_match = re.search(r"\b(?:Liabilities|Total Liabilities|Existing Obligations|Total Debt)[\s:]*([^\n\r,;]{3,80})", text, re.IGNORECASE)
-    if liab_match:
-        res["liabilities"] = liab_match.group(1).strip()
-
-    # 21. Collateral
-    coll_match = re.search(r"\b(?:Collateral|Security Offered|Pledged Property|Hypothecation|Mortgage Details)[\s:]*([^\n\r,;]{3,80})", text, re.IGNORECASE)
-    if coll_match:
-        res["collateral"] = coll_match.group(1).strip()
+    income_match = _first_match([
+        r"(?:Gross Salary|Net Salary|Monthly Income|Gross Income|Verified Income|Basic Pay|Total Earnings)[\s:]*[\-:]*\s*(?:Rs\.?|INR|₹)?\s*([\d,]+(?:\.\d{2})?)",
+    ], text, re.IGNORECASE)
+    if income_match:
+        res["income"] = f"₹{income_match}"
 
     return res
 
+
 def extract_document_details(file_bytes: bytes, filename: str, doc_type: str = "") -> Dict[str, Any]:
-    raw_text = extract_text_from_bytes(file_bytes, filename)
+    raw_text = extract_text_from_bytes(file_bytes, filename, doc_type)
     extracted = extract_field_values(raw_text, filename, doc_type)
-    detected_count = sum(1 for v in extracted.values() if v != "Not Found")
+    detected_count = sum(1 for v in extracted.values() if v not in ("Not Found", None, ""))
     total_fields = len(extracted)
 
     return {
