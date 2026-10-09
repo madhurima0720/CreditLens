@@ -32,6 +32,8 @@ audit_log_collection        = None
 users_collection            = None
 human_decisions_collection  = None
 
+DOCUMENTS_DB: list[dict] = []
+ASSESSMENTS_DB: list[dict] = []
 SEED_APPLICANTS = []
 
 async def connect_db() -> None:
@@ -98,11 +100,36 @@ async def clean_applicants_collection() -> dict:
     logger.info("Cleaned applicants collection: removed %d records.", result.deleted_count)
     return {"status": "success", "deleted_count": result.deleted_count}
 
+async def save_document_record(record: dict) -> str:
+    """Save document record to MongoDB Atlas 'documents' collection or in-memory fallback."""
+    DOCUMENTS_DB.append(dict(record))
+    if document_collection is not None:
+        try:
+            await document_collection.insert_one(dict(record))
+            logger.info("Saved document record %s to MongoDB Atlas.", record.get("id"))
+        except Exception as exc:
+            logger.warning("MongoDB Atlas document write failed (%s) — saved in-memory.", exc)
+    return record.get("id", "")
+
+
+async def save_assessment_record(record: dict) -> str:
+    """Save assessment record to MongoDB Atlas 'assessments' collection or in-memory fallback."""
+    ASSESSMENTS_DB.append(dict(record))
+    if assessment_collection is not None:
+        try:
+            await assessment_collection.insert_one(dict(record))
+            logger.info("Saved assessment record %s to MongoDB Atlas.", record.get("id"))
+        except Exception as exc:
+            logger.warning("MongoDB Atlas assessment write failed (%s) — saved in-memory.", exc)
+    return record.get("id", "")
+
+
 async def close_db() -> None:
     global _client
     if _client:
         _client.close()
         logger.info("MongoDB connection closed.")
+
 
 async def ping_database() -> dict:
     global _client, _database
@@ -110,9 +137,11 @@ async def ping_database() -> dict:
         return {"status": "not_initialized", "database": DB_NAME}
     try:
         await _client.admin.command("ping")
-        apps_count  = await applicant_collection.count_documents({})
-        decs_count  = await human_decisions_collection.count_documents({})
-        audit_count = await audit_log_collection.count_documents({})
+        apps_count    = await applicant_collection.count_documents({})
+        decs_count    = await human_decisions_collection.count_documents({})
+        audit_count   = await audit_log_collection.count_documents({})
+        docs_count    = await document_collection.count_documents({})
+        assess_count  = await assessment_collection.count_documents({})
         return {
             "status":    "connected",
             "database":  DB_NAME,
@@ -121,7 +150,10 @@ async def ping_database() -> dict:
                 "applicants":       apps_count,
                 "human_decisions":  decs_count,
                 "audit_logs":       audit_count,
+                "documents":        docs_count,
+                "assessments":      assess_count,
             }
         }
     except Exception as exc:
         return {"status": "error", "database": DB_NAME, "detail": str(exc)}
+

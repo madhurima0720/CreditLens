@@ -142,7 +142,8 @@ def _first_match(patterns, text: str, flags: int = 0) -> Optional[str]:
     for pattern in patterns:
         match = re.search(pattern, text, flags)
         if match:
-            return _clean_text(match.group(1))
+            val = match.group(1) if match.groups() else match.group(0)
+            return _clean_text(val)
     return None
 
 

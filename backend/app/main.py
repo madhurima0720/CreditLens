@@ -9,6 +9,21 @@ import logging
 from datetime import datetime, timezone
 from app.services.document_verifier import verify_documents, validate_upload, DOC_TYPE_LABELS, normalize_doc_type
 from app.ocr_engine import extract_document_details, ALL_FIELDS
+from app.services.ocr_service import (
+    parse_and_validate_document,
+    extract_raw_text,
+    validate_and_classify_financial_document,
+    InvalidDocumentError,
+    OCRProcessingError,
+    get_tesseract_path,
+    is_tesseract_available
+)
+from app.services.ai_analysis import (
+    analyze_document_with_ollama,
+    detect_document_anomalies,
+    resolve_ollama_model
+)
+from app.risk_calculator import compute_risk_assessment
 import app.database as db_module
 
 logger = logging.getLogger("creditlens.api")
@@ -175,11 +190,73 @@ async def db_health_check():
     from fastapi.responses import JSONResponse
     return JSONResponse(content=result, status_code=status_code)
 
+async def _persist_risk_assessment(resp: RiskAssessmentResponse, payload_dict: Optional[Dict[str, Any]] = None) -> str:
+    """Helper to persist completed risk assessment and audit event to MongoDB Atlas."""
+    now = _now_iso()
+    asm_id = f"ASM-{uuid.uuid4().hex[:8].upper()}"
+    record = {
+        "id": asm_id,
+        "applicant_name": resp.applicant_name,
+        "loan_type": resp.loan_type,
+        "health_score": resp.health_score,
+        "risk_classification": resp.risk_classification,
+        "decision": resp.decision,
+        "dti_ratio_percent": resp.dti_ratio_percent,
+        "single_line_explanation": resp.single_line_explanation,
+        "single_line_verdict": resp.single_line_verdict,
+        "estimated_new_emi": resp.estimated_new_emi,
+        "total_monthly_debt": resp.total_monthly_debt,
+        "disposable_income": resp.disposable_income,
+        "safe_credit_limit": resp.safe_credit_limit,
+        "income_mismatch_flag": resp.income_mismatch_flag,
+        "identity_mismatch_flag": resp.identity_mismatch_flag,
+        "tamper_flag": resp.tamper_flag,
+        "missing_documents": resp.missing_documents,
+        "mismatched_fields": resp.mismatched_fields,
+        "confidence_score": resp.confidence_score,
+        "positive_signals": resp.positive_signals,
+        "risk_factors": [rf.model_dump() if hasattr(rf, "model_dump") else dict(rf) for rf in resp.risk_factors],
+        "recommendation": resp.recommendation,
+        "created_at": now,
+    }
+    try:
+        await db_module.save_assessment_record(record)
+        if db_module.audit_log_collection is not None:
+            await db_module.audit_log_collection.insert_one({
+                "event_type": "RISK_ASSESSMENT_COMPLETED",
+                "assessment_id": asm_id,
+                "actor": "RISK_ENGINE",
+                "actor_role": "Automated Underwriter",
+                "description": f"Risk assessment performed for {resp.applicant_name}: Verdict '{resp.decision}', Health Score {resp.health_score}/100.",
+                "metadata": {"health_score": resp.health_score, "decision": resp.decision, "risk_tier": resp.risk_classification},
+                "timestamp": now,
+            })
+    except Exception as exc:
+        logger.warning("Assessment MongoDB logging warning: %s", exc)
+    return asm_id
+
+
 @app.post("/api/v1/scan-document")
 async def scan_document(
     file: UploadFile = File(...),
-    document_type: Optional[str] = Form(default="bank_statement")
+    document_type: Optional[str] = Form(default="bank_statement"),
+    loan_type: Optional[str] = Form(default="Home Loan"),
+    requested_loan: Optional[float] = Form(default=None),
+    loan_tenure_months: Optional[int] = Form(default=48),
+    annual_interest_rate: Optional[float] = Form(default=10.5),
+    savings_amount: Optional[float] = Form(default=None),
+    declared_salary: Optional[float] = Form(default=None),
+    declared_applicant_name: Optional[str] = Form(default=None),
 ):
+    """
+    Local privacy-focused Document Intelligence & OCR Pipeline:
+    1. Tesseract OCR + PIL / pdf2image: extracts raw text dynamically.
+    2. Financial keyword validation: checks sufficient financial terminology.
+    3. Ollama LLM Analysis: extracts Applicant Name, Monthly Income, Debt / EMI, Account No, Doc Type (temperature=0.0).
+    4. Anomaly detection against declared fields.
+    5. Risk Scoring Engine evaluation.
+    6. Persists document metrics, anomalies, and assessment to MongoDB Atlas (creditlens_db).
+    """
     filename = file.filename or "uploaded_document.pdf"
     file_size_bytes = 0
 
@@ -187,10 +264,8 @@ async def scan_document(
     try:
         content = await file.read()
         file_size_bytes = len(content)
-    except Exception:
-        pass
-
-    filename_lower = filename.lower()
+    except Exception as exc:
+        logger.error("Failed reading uploaded file bytes: %s", exc)
 
     normalized_doc_type = normalize_doc_type(document_type)
     validation = validate_upload(normalized_doc_type, filename, confidence=90.0)
@@ -205,38 +280,219 @@ async def scan_document(
             }
         )
 
-    extraction = extract_document_details(content, filename, normalized_doc_type or "")
-    fields = extraction["fields"]
+    # 1 & 2: Local Tesseract OCR & Financial Classification Check
+    try:
+        raw_ocr_text, classification = parse_and_validate_document(content, filename, strict=True)
+    except InvalidDocumentError as inv_err:
+        logger.warning("Document failed financial keyword validation: %s", inv_err)
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": inv_err.message,
+                "classification": inv_err.details,
+                "file_name": filename,
+                "doc_type": normalized_doc_type,
+                "badge": "INVALID_DOCUMENT",
+            }
+        )
+    except OCRProcessingError as ocr_err:
+        logger.error("OCR extraction processing failed: %s", ocr_err)
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": f"OCR processing failure: {ocr_err}",
+                "file_name": filename,
+                "doc_type": normalized_doc_type,
+                "badge": "CORRUPTED_DOCUMENT",
+            }
+        )
+    except Exception as exc:
+        logger.error("Unexpected document extraction error: %s", exc)
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": f"Failed to extract document contents: {exc}",
+                "file_name": filename,
+                "badge": "EXTRACTION_FAILED",
+            }
+        )
+
+    # 3. Local Ollama LLM Entity Extraction (temperature=0.0)
+    llm_result = analyze_document_with_ollama(raw_ocr_text)
+
+    # Secondary regex extraction for identity / contact fields (Aadhaar, PAN, Phone, Email, Address)
+    regex_extraction = extract_document_details(content, filename, normalized_doc_type or "")
+    fields = dict(regex_extraction.get("fields", {}))
+
+    # Merge LLM extracted fields into standardized underwriting fields
+    applicant_name = llm_result.get("applicant_name")
+    if applicant_name:
+        fields["name"] = applicant_name
+
+    monthly_income = llm_result.get("monthly_income")
+    if monthly_income is not None:
+        fields["income"] = f"INR {monthly_income:,.2f}"
+
+    existing_debt = llm_result.get("existing_debt_emi")
+    if existing_debt is not None:
+        fields["existing_loans_emis"] = f"INR {existing_debt:,.2f}"
+
+    account_no = llm_result.get("account_number")
+    if account_no:
+        if normalized_doc_type in ("bank_statement", "BANK_STMT"):
+            fields["bank_details"] = f"A/C: {account_no}"
+        else:
+            fields["loan_account_number"] = account_no
+
+    detected_doc_type = llm_result.get("document_type", "UNKNOWN")
+
+    # 4. Anomaly detection on document entities
+    anomalies = detect_document_anomalies(
+        llm_result,
+        declared_applicant_name=declared_applicant_name,
+        declared_salary=declared_salary
+    )
+
+    detected_count = sum(1 for v in fields.values() if v and v != "Not Found")
+    total_fields = len(ALL_FIELDS)
 
     extracted_data = {
         "document_category": DOC_TYPE_LABELS.get(document_type, "Financial Document"),
-        "account_holder_name": fields.get("name") if fields.get("name") != "Not Found" else "Not Found",
-        "pan_identifier": fields.get("pan") if fields.get("pan") != "Not Found" else "Not Found",
-        "aadhaar": fields.get("aadhaar") if fields.get("aadhaar") != "Not Found" else "Not Found",
-        "verified_monthly_income": fields.get("income") if fields.get("income") != "Not Found" else "Not Found",
-        "loan_amount": fields.get("loan_amount") if fields.get("loan_amount") != "Not Found" else "Not Found",
-        "confidence_score": 98.5 if extraction["detected_count"] > 0 else 50.0,
-        "anomaly_detected": False
+        "account_holder_name": applicant_name or fields.get("name", "Not Found"),
+        "pan_identifier": fields.get("pan", "Not Found"),
+        "aadhaar": fields.get("aadhaar", "Not Found"),
+        "verified_monthly_income": f"INR {monthly_income:,.2f}" if monthly_income is not None else fields.get("income", "Not Found"),
+        "existing_debt_emi": f"INR {existing_debt:,.2f}" if existing_debt is not None else fields.get("existing_loans_emis", "Not Found"),
+        "account_number": account_no or "Not Found",
+        "detected_document_type": detected_doc_type,
+        "loan_amount": fields.get("loan_amount", "Not Found"),
+        "confidence_score": llm_result.get("confidence", 95.0),
+        "anomaly_detected": len(anomalies) > 0,
+        "anomalies": anomalies,
+        "llm_engine": llm_result.get("model_used"),
+        "llm_used": llm_result.get("llm_used", False),
+        "ocr_engine": "Tesseract OCR (Local)",
     }
+
+    # 5. Persist document metrics & anomalies into MongoDB Atlas
+    now = _now_iso()
+    doc_id = f"DOC-{uuid.uuid4().hex[:8].upper()}"
+    document_record = {
+        "id": doc_id,
+        "file_name": filename,
+        "size_bytes": file_size_bytes,
+        "doc_type": normalized_doc_type,
+        "detected_doc_type": detected_doc_type,
+        "extracted_name": applicant_name or fields.get("name"),
+        "verified_monthly_income": monthly_income,
+        "existing_debt_emi": existing_debt,
+        "account_number": account_no,
+        "confidence": llm_result.get("confidence", 95.0),
+        "anomalies": anomalies,
+        "classification": classification,
+        "extracted_fields": fields,
+        "ocr_raw_snippet": raw_ocr_text[:2000] if raw_ocr_text else "",
+        "created_at": now,
+    }
+
+    try:
+        await db_module.save_document_record(document_record)
+        if db_module.audit_log_collection is not None:
+            await db_module.audit_log_collection.insert_one({
+                "event_type": "DOCUMENT_SCANNED_AND_ANALYZED",
+                "document_id": doc_id,
+                "actor": "OCR_PIPELINE",
+                "actor_role": "Document Intelligence Engine",
+                "description": f"Document '{filename}' parsed via Tesseract OCR + Ollama ({llm_result.get('model_used')}). Extracted: Name='{applicant_name}', Income={monthly_income}.",
+                "metadata": {"doc_id": doc_id, "anomalies_count": len(anomalies), "llm_used": llm_result.get("llm_used")},
+                "timestamp": now,
+            })
+    except Exception as exc:
+        logger.warning("MongoDB document logging warning: %s", exc)
+
+    # 6. Route extracted metrics to Risk Scoring Engine
+    calc_salary = monthly_income if (monthly_income is not None and monthly_income > 0) else (declared_salary or 85000.0)
+    calc_emis = existing_debt if existing_debt is not None else 0.0
+    calc_name = applicant_name or declared_applicant_name or fields.get("name") or "Applicant"
+    calc_savings = savings_amount if savings_amount is not None else max(100000.0, calc_salary * 4.0)
+    calc_loan = requested_loan if requested_loan is not None else max(200000.0, calc_salary * 15.0)
+
+    scoring_res = compute_risk_assessment(
+        applicant_name=calc_name,
+        loan_type=loan_type or "Home Loan",
+        monthly_salary=calc_salary,
+        existing_emis=calc_emis,
+        savings_amount=calc_savings,
+        requested_loan=calc_loan,
+        loan_tenure_months=loan_tenure_months or 48,
+        annual_interest_rate=annual_interest_rate or 10.5,
+        verified_salary=monthly_income,
+        anomalies=anomalies,
+    )
+    risk_resp = RiskAssessmentResponse(**scoring_res.model_dump())
+    assessment_id = await _persist_risk_assessment(risk_resp, {
+        "source": "DOCUMENT_SCAN_PIPELINE",
+        "document_id": doc_id,
+        "filename": filename,
+    })
 
     return {
         "status": "success",
-        "message": "Document parsed successfully by CreditLens Anti-Tamper OCR Engine",
+        "message": "Document parsed and analyzed successfully by CreditLens Tesseract OCR + Ollama LLM Pipeline",
         "filename": filename,
+        "document_id": doc_id,
+        "assessment_id": assessment_id,
         "size_bytes": file_size_bytes,
-        "detected_count": extraction["detected_count"],
-        "total_fields": extraction["total_fields"],
+        "detected_count": detected_count,
+        "total_fields": total_fields,
         "extracted_details": fields,
-        "extracted_data": extracted_data
+        "extracted_data": extracted_data,
+        "llm_analysis": llm_result,
+        "anomalies": anomalies,
+        "classification": classification,
+        "risk_assessment": risk_resp.model_dump(),
     }
 
+
+@app.post("/api/v1/assess-loan-document", response_model=RiskAssessmentResponse)
+async def assess_loan_document(
+    file: UploadFile = File(...),
+    loan_type: str = Form(default="Home Loan"),
+    requested_loan: float = Form(default=2500000.0),
+    loan_tenure_months: int = Form(default=48),
+    annual_interest_rate: float = Form(default=10.5),
+    savings_amount: float = Form(default=1250000.0),
+    applicant_name: Optional[str] = Form(default=None),
+    declared_salary: Optional[float] = Form(default=None),
+    document_type: Optional[str] = Form(default="bank_statement"),
+):
+    """
+    Dedicated endpoint routing Document Upload -> Tesseract OCR -> Ollama Analysis -> Risk Scoring Engine.
+    Persists document metrics, anomalies, and risk assessment to MongoDB Atlas (creditlens_db).
+    """
+    scan_result = await scan_document(
+        file=file,
+        document_type=document_type,
+        loan_type=loan_type,
+        requested_loan=requested_loan,
+        loan_tenure_months=loan_tenure_months,
+        annual_interest_rate=annual_interest_rate,
+        savings_amount=savings_amount,
+        declared_salary=declared_salary,
+        declared_applicant_name=applicant_name,
+    )
+    risk_dict = scan_result["risk_assessment"]
+    return RiskAssessmentResponse(**risk_dict)
+
+
 @app.post("/api/v1/assess-risk", response_model=RiskAssessmentResponse)
-def assess_risk(payload: RiskAssessmentRequest):
+async def assess_risk(payload: RiskAssessmentRequest):
     """
     1. Cross-checks mandatory document completeness per loan_type.
     2. Performs Cross-Document Identity & Fraud Analysis (Name mismatch, Tampering, Sudden Cash Deposits).
     3. If identity mismatch or tampering is detected -> Sets decision to REJECTED - FRAUD / MISMATCH DETECTED.
     4. If documentation is complete and clean -> Computes DTI, CIBIL, Health Score, and outputs APPROVE or REJECT.
+    5. Persists assessment result to MongoDB Atlas assessments collection.
     """
     loan_type_key = payload.loan_type
     required_doc_codes = MANDATORY_DOCUMENTS.get(
@@ -248,221 +504,27 @@ def assess_risk(payload: RiskAssessmentRequest):
     missing_codes = [code for code in required_doc_codes if code not in uploaded_set]
     missing_doc_names = [DOC_CODE_LABELS.get(code, code) for code in missing_codes]
 
-    if missing_codes:
-        missing_str = ", ".join(missing_doc_names)
-        single_line_exp = f"Missing Required Document: {missing_str} must be uploaded before risk assessment."
-        single_line_verd = f"Rejected: Application is incomplete due to missing {len(missing_codes)} mandatory document(s)."
-
-        return RiskAssessmentResponse(
-            applicant_name=payload.applicant_name,
-            loan_type=payload.loan_type,
-            dti_ratio_percent=0.0,
-            health_score=0,
-            risk_classification="HIGH RISK / INCOMPLETE",
-            decision="REJECTED - INCOMPLETE APPLICATION",
-            single_line_explanation=single_line_exp,
-            single_line_verdict=single_line_verd,
-            estimated_new_emi=0.0,
-            total_monthly_debt=0.0,
-            disposable_income=0.0,
-            safe_credit_limit=0.0,
-            income_mismatch_flag=False,
-            identity_mismatch_flag=False,
-            tamper_flag=False,
-            missing_documents=missing_doc_names,
-            mismatched_fields=[],
-            confidence_score=0.0,
-            positive_signals=[],
-            risk_factors=[
-                RiskFactorDetail(
-                    category="Incomplete Documentation",
-                    severity="CRITICAL",
-                    message=single_line_exp
-                )
-            ],
-            recommendation="Application rejected due to missing mandatory documentation. Upload missing documents to proceed."
-        )
-
-    mismatched_fields: List[str] = []
-    identity_mismatch_flag = False
-    tamper_flag = False
-
-    applicant_clean = payload.applicant_name.strip().lower()
-
-    if payload.pay_slip_account_name:
-        ps_name = payload.pay_slip_account_name.strip().lower()
-        if ps_name != applicant_clean and ps_name not in applicant_clean and applicant_clean not in ps_name:
-            identity_mismatch_flag = True
-            mismatched_fields.append(f"Pay Slip Account Name ('{payload.pay_slip_account_name}') mismatches Applicant Name ('{payload.applicant_name}')")
-
-    if payload.bank_account_holder_name:
-        ba_name = payload.bank_account_holder_name.strip().lower()
-        if ba_name != applicant_clean and ba_name not in applicant_clean and applicant_clean not in ba_name:
-            identity_mismatch_flag = True
-            mismatched_fields.append(f"Bank Account Holder Name ('{payload.bank_account_holder_name}') mismatches Applicant Name ('{payload.applicant_name}')")
-
-    if payload.simulate_cash_injection_anomaly:
-        tamper_flag = True
-        mismatched_fields.append("Unusual Bank Behavior: Sudden ₹15,00,000 cash deposit detected 48h prior to application submission")
-
-    if payload.simulate_pdf_metadata_tampering:
-        tamper_flag = True
-        mismatched_fields.append("Anti-Tamper Scan: Modified PDF font streams & altered salary figures detected in uploaded pay slip")
-
-    if identity_mismatch_flag or tamper_flag:
-        single_line_exp = f"Cross-document entity verification failed: {'; '.join(mismatched_fields)}."
-        single_line_verd = "Rejected: Identity mismatch / fraudulent pattern detected between uploaded pay slip and bank statement."
-
-        return RiskAssessmentResponse(
-            applicant_name=payload.applicant_name,
-            loan_type=payload.loan_type,
-            dti_ratio_percent=0.0,
-            health_score=15,
-            risk_classification="Anomalies / Fraud Alert",
-            decision="REJECTED - FRAUD / MISMATCH DETECTED",
-            single_line_explanation=single_line_exp,
-            single_line_verdict=single_line_verd,
-            estimated_new_emi=0.0,
-            total_monthly_debt=0.0,
-            disposable_income=0.0,
-            safe_credit_limit=0.0,
-            income_mismatch_flag=False,
-            identity_mismatch_flag=identity_mismatch_flag,
-            tamper_flag=tamper_flag,
-            missing_documents=[],
-            mismatched_fields=mismatched_fields,
-            confidence_score=99.2,
-            positive_signals=[],
-            risk_factors=[
-                RiskFactorDetail(
-                    category="Identity & Fraud Sentinel",
-                    severity="CRITICAL",
-                    message=field_msg
-                ) for field_msg in mismatched_fields
-            ],
-            recommendation="Application escalated to Fraud Investigation Unit. Identity or PDF tampering detected."
-        )
-
-    salary = payload.monthly_salary
-    existing_emi = payload.existing_emis
-    savings = payload.savings_amount
-    loan_amount = payload.requested_loan
-    tenure = payload.loan_tenure_months
-    annual_rate = payload.annual_interest_rate
-
-    monthly_rate = (annual_rate / 100.0) / 12.0
-    if monthly_rate > 0:
-        new_emi_calc = (loan_amount * monthly_rate * math.pow(1 + monthly_rate, tenure)) / (math.pow(1 + monthly_rate, tenure) - 1)
-    else:
-        new_emi_calc = loan_amount / tenure
-
-    new_emi = round(new_emi_calc, 2)
-    total_monthly_debt = round(existing_emi + new_emi, 2)
-    disposable_income = round(max(0.0, salary - total_monthly_debt), 2)
-    dti_ratio = round((total_monthly_debt / salary) * 100.0, 2)
-
-    income_mismatch_flag = False
-    if payload.verified_salary is not None and payload.verified_salary > 0:
-        diff_pct = abs(payload.verified_salary - salary) / salary
-        if diff_pct > 0.10:
-            income_mismatch_flag = True
-
-    base_score = 100.0
-    if dti_ratio > 50.0:
-        base_score -= (dti_ratio - 50.0) * 1.5 + 20.0
-    elif dti_ratio > 40.0:
-        base_score -= (dti_ratio - 40.0) * 1.0 + 5.0
-    else:
-        base_score -= (dti_ratio * 0.2)
-
-    months_liquidity_coverage = savings / total_monthly_debt if total_monthly_debt > 0 else 12.0
-    if months_liquidity_coverage >= 6.0:
-        base_score += 8.0
-    elif months_liquidity_coverage < 2.0:
-        base_score -= 15.0
-
-    if income_mismatch_flag:
-        base_score -= 25.0
-
-    health_score = max(10, min(100, round(base_score)))
-
-    if income_mismatch_flag:
-        risk_classification = "Anomalies"
-        decision = "REJECT"
-    elif health_score >= 75:
-        risk_classification = "Low Risk"
-        decision = "APPROVE"
-    elif health_score >= 50:
-        risk_classification = "Medium Risk"
-        decision = "APPROVE"
-    else:
-        risk_classification = "High Risk"
-        decision = "REJECT"
-
-    cibil_benchmark = min(850, max(600, round(740 + (savings > 1000000 and 30 or 0) - dti_ratio * 1.5)))
-    single_line_explanation = f"Score assigned at {health_score}/100 based on CIBIL benchmark of {cibil_benchmark}, verified monthly income of ₹{salary:,.2f}, and a post-loan DTI ratio of {dti_ratio}%."
-
-    if decision == "APPROVE":
-        single_line_verdict = f"Approved: Strong liquid savings of ₹{savings:,.2f} and verified income stream offset incremental EMI obligations within policy ceiling."
-    else:
-        single_line_verdict = f"Rejected: Combined debt obligations drive post-loan DTI ratio to {dti_ratio}%, exceeding institutional maximum exposure ceiling of 45%."
-
-    max_allowable_debt = salary * 0.45
-    max_allowable_new_emi = max(0.0, max_allowable_debt - existing_emi)
-    if monthly_rate > 0:
-        safe_credit_limit = round(
-            (max_allowable_new_emi * (math.pow(1 + monthly_rate, tenure) - 1)) / (monthly_rate * math.pow(1 + monthly_rate, tenure)),
-            2
-        )
-    else:
-        safe_credit_limit = round(max_allowable_new_emi * tenure, 2)
-
-    positive_signals: List[str] = []
-    risk_factors: List[RiskFactorDetail] = []
-
-    if dti_ratio <= 40.0:
-        positive_signals.append(f"Healthy Debt-to-Income (DTI) ratio of {dti_ratio}% is well within the 40% ceiling.")
-    else:
-        risk_factors.append(RiskFactorDetail(
-            category="DTI Exposure",
-            severity="WARNING" if dti_ratio <= 50.0 else "CRITICAL",
-            message=f"Post-disbursement DTI reaches {dti_ratio}%, exceeding standard safety thresholds."
-        ))
-
-    if months_liquidity_coverage >= 6.0:
-        positive_signals.append(f"Strong liquid savings buffer covering {round(months_liquidity_coverage, 1)} months of total debt service.")
-
-    if not risk_factors:
-        positive_signals.append("Zero document anomalies, identity mismatches, or policy breaches detected by CreditLens AI.")
-
-    recommendation = (
-        "Approved for automated processing. Low default probability." if decision == "APPROVE"
-        else "High risk of default under current requested loan terms. Rejection or debt restructure advised."
-    )
-
-    return RiskAssessmentResponse(
+    scoring_res = compute_risk_assessment(
         applicant_name=payload.applicant_name,
         loan_type=payload.loan_type,
-        dti_ratio_percent=dti_ratio,
-        health_score=health_score,
-        risk_classification=risk_classification,
-        decision=decision,
-        single_line_explanation=single_line_explanation,
-        single_line_verdict=single_line_verdict,
-        estimated_new_emi=new_emi,
-        total_monthly_debt=total_monthly_debt,
-        disposable_income=disposable_income,
-        safe_credit_limit=safe_credit_limit,
-        income_mismatch_flag=income_mismatch_flag,
-        identity_mismatch_flag=False,
-        tamper_flag=False,
-        missing_documents=[],
-        mismatched_fields=[],
-        confidence_score=98.5,
-        positive_signals=positive_signals,
-        risk_factors=risk_factors,
-        recommendation=recommendation
+        monthly_salary=payload.monthly_salary,
+        existing_emis=payload.existing_emis,
+        savings_amount=payload.savings_amount,
+        requested_loan=payload.requested_loan,
+        loan_tenure_months=payload.loan_tenure_months,
+        annual_interest_rate=payload.annual_interest_rate,
+        verified_salary=payload.verified_salary,
+        pay_slip_account_name=payload.pay_slip_account_name,
+        bank_account_holder_name=payload.bank_account_holder_name,
+        missing_documents=missing_doc_names,
+        simulate_cash_injection_anomaly=payload.simulate_cash_injection_anomaly,
+        simulate_pdf_metadata_tampering=payload.simulate_pdf_metadata_tampering,
     )
+
+    resp = RiskAssessmentResponse(**scoring_res.model_dump())
+    await _persist_risk_assessment(resp, payload.model_dump())
+    return resp
+
 
 LOAN_DOC_DESCRIPTIONS: Dict[str, str] = {
     "Home Loan":                "Government ID (Aadhaar/PAN), Address Proof, Salary Slips, 6-month Bank Statement, Form 16 / ITR, Property Title & Agreement Documents.",
