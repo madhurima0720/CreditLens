@@ -235,6 +235,89 @@ class TestDocumentIntelligencePipeline(unittest.TestCase):
         self.assertIn("health_score", data)
         self.assertIn("dti_ratio_percent", data)
 
+    def test_11_dataset_loading_and_summary(self):
+        """Verify loan approval prediction dataset loading from backend/data/."""
+        from app.dataset_loader import get_dataset_summary, load_loan_dataset
+        summary = get_dataset_summary()
+        self.assertTrue(summary["loaded"], f"Dataset failed to load: {summary}")
+        self.assertGreaterEqual(summary["total_rows"], 1000)
+        self.assertEqual(summary["total_columns"], 39)
+        self.assertIn("Monthly_Income", summary["columns"])
+        self.assertIn("Monthly_EMI", summary["columns"])
+        self.assertIn("Loan_Amount", summary["columns"])
+
+        sample_rows = load_loan_dataset(limit=5)
+        self.assertEqual(len(sample_rows), 5)
+        first = sample_rows[0]
+        self.assertTrue(isinstance(first["Monthly_Income"], (int, float)))
+
+    def test_12_risk_scoring_on_dataset_records(self):
+        """Verify Risk Scoring Engine calculates valid metrics on dataset records."""
+        from app.dataset_loader import load_loan_dataset
+        sample_rows = load_loan_dataset(limit=10)
+        for row in sample_rows:
+            income = float(row.get("Monthly_Income", 50000))
+            emis = float(row.get("Monthly_EMI", 0))
+            savings = float(row.get("Savings", income * 3))
+            loan = float(row.get("Loan_Amount", 500000))
+            tenure = int(row.get("Loan_Tenure", 36))
+            rate = float(row.get("Interest_Rate", 10.5))
+            applicant = str(row.get("Application_ID", "APP-TEST"))
+            loan_type = str(row.get("Loan_Purpose", "Personal Loan"))
+
+            res = compute_risk_assessment(
+                applicant_name=applicant,
+                loan_type=loan_type,
+                monthly_salary=income,
+                existing_emis=emis,
+                savings_amount=savings,
+                requested_loan=loan,
+                loan_tenure_months=tenure,
+                annual_interest_rate=rate,
+            )
+            self.assertIn(res.decision, ["APPROVE", "REJECT"])
+            self.assertGreaterEqual(res.health_score, 0)
+            self.assertLessEqual(res.health_score, 100)
+
+    def test_13_user_ocr_samples_exist_and_validate(self):
+        """Verify user sample files in backend/data/ocr_samples/ parse and validate."""
+        samples_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "data", "ocr_samples"))
+        self.assertTrue(os.path.isdir(samples_dir), "ocr_samples directory must exist")
+        files = os.listdir(samples_dir)
+        self.assertGreater(len(files), 0, "ocr_samples directory must contain files")
+
+        for fname in ["sample pay slip.pdf", "download (1).jpg", "download.jpg"]:
+            fpath = os.path.join(samples_dir, fname)
+            if os.path.isfile(fpath):
+                with open(fpath, "rb") as fh:
+                    raw_text, classification = parse_and_validate_document(fh.read(), fname, strict=False)
+                self.assertGreater(len(raw_text), 20, f"Expected text from {fname}")
+                self.assertTrue(classification["is_valid"], f"Classification failed for {fname}: {classification}")
+
+    def test_14_user_sample_pay_slip_e2e_scan(self):
+        """Verify end-to-end /api/v1/scan-document pipeline on user's sample pay slip.pdf."""
+        samples_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "data", "ocr_samples"))
+        slip_path = os.path.join(samples_dir, "sample pay slip.pdf")
+        if not os.path.isfile(slip_path):
+            self.skipTest("sample pay slip.pdf not found in ocr_samples")
+
+        with open(slip_path, "rb") as fh:
+            content = fh.read()
+
+        res = self.client.post(
+            "/api/v1/scan-document",
+            files={"file": ("sample_pay_slip.pdf", content, "application/pdf")},
+            data={"document_type": "salary_slip", "loan_type": "Personal Loan", "requested_loan": 300000.0},
+        )
+        self.assertEqual(res.status_code, 200, f"Scan failed: {res.text}")
+        data = res.json()
+        self.assertEqual(data["status"], "success")
+        self.assertTrue(data["document_id"].startswith("DOC-"))
+        self.assertTrue(data["assessment_id"].startswith("ASM-"))
+        self.assertIn("risk_assessment", data)
+        self.assertIn(data["risk_assessment"]["decision"], ["APPROVE", "REJECT"])
+
 
 if __name__ == "__main__":
     unittest.main()
+

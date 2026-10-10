@@ -149,6 +149,12 @@ class RiskAssessmentResponse(BaseModel):
     positive_signals: List[str]
     risk_factors: List[RiskFactorDetail]
     recommendation: str
+    dob: Optional[str] = None
+    gender: Optional[str] = None
+    aadhaar_number: Optional[str] = None
+    pan_identifier: Optional[str] = None
+    monthly_income: Optional[float] = None
+    extracted_details: Optional[Dict[str, Any]] = None
 
 class CopilotQueryRequest(BaseModel):
     query: str = Field(..., example="Why was this applicant flagged?")
@@ -337,6 +343,22 @@ async def scan_document(
     if existing_debt is not None:
         fields["existing_loans_emis"] = f"INR {existing_debt:,.2f}"
 
+    dob = llm_result.get("dob") or fields.get("dob")
+    if dob and dob != "Not Found":
+        fields["dob"] = dob
+
+    gender = llm_result.get("gender") or fields.get("gender")
+    if gender and gender != "Not Found":
+        fields["gender"] = gender
+
+    aadhaar_number = llm_result.get("aadhaar_number") or fields.get("aadhaar")
+    if aadhaar_number and aadhaar_number != "Not Found":
+        fields["aadhaar"] = aadhaar_number
+
+    pan_identifier = llm_result.get("pan_identifier") or fields.get("pan")
+    if pan_identifier and pan_identifier != "Not Found":
+        fields["pan"] = pan_identifier
+
     account_no = llm_result.get("account_number")
     if account_no:
         if normalized_doc_type in ("bank_statement", "BANK_STMT"):
@@ -359,9 +381,12 @@ async def scan_document(
     extracted_data = {
         "document_category": DOC_TYPE_LABELS.get(document_type, "Financial Document"),
         "account_holder_name": applicant_name or fields.get("name", "Not Found"),
-        "pan_identifier": fields.get("pan", "Not Found"),
-        "aadhaar": fields.get("aadhaar", "Not Found"),
+        "pan_identifier": pan_identifier if (pan_identifier and pan_identifier != "Not Found") else fields.get("pan", "Not Found"),
+        "aadhaar": aadhaar_number if (aadhaar_number and aadhaar_number != "Not Found") else fields.get("aadhaar", "Not Found"),
+        "dob": dob if (dob and dob != "Not Found") else fields.get("dob", "Not Found"),
+        "gender": gender if (gender and gender != "Not Found") else fields.get("gender", "Not Found"),
         "verified_monthly_income": f"INR {monthly_income:,.2f}" if monthly_income is not None else fields.get("income", "Not Found"),
+        "monthly_income": monthly_income,
         "existing_debt_emi": f"INR {existing_debt:,.2f}" if existing_debt is not None else fields.get("existing_loans_emis", "Not Found"),
         "account_number": account_no or "Not Found",
         "detected_document_type": detected_doc_type,
@@ -436,12 +461,26 @@ async def scan_document(
         "filename": filename,
     })
 
+    clean_dob_resp = dob if (dob and dob != "Not Found") else ""
+    clean_gender_resp = gender if (gender and gender != "Not Found") else ""
+    clean_aadhaar_resp = aadhaar_number if (aadhaar_number and aadhaar_number != "Not Found") else ""
+    clean_pan_resp = pan_identifier if (pan_identifier and pan_identifier != "Not Found") else ""
+    clean_name_resp = applicant_name or fields.get("name", "")
+    if clean_name_resp == "Not Found":
+        clean_name_resp = ""
+
     return {
         "status": "success",
         "message": "Document parsed and analyzed successfully by CreditLens Tesseract OCR + Ollama LLM Pipeline",
         "filename": filename,
         "document_id": doc_id,
         "assessment_id": assessment_id,
+        "applicant_name": clean_name_resp,
+        "dob": clean_dob_resp,
+        "gender": clean_gender_resp,
+        "aadhaar_number": clean_aadhaar_resp,
+        "pan_identifier": clean_pan_resp,
+        "monthly_income": monthly_income,
         "size_bytes": file_size_bytes,
         "detected_count": detected_count,
         "total_fields": total_fields,
@@ -481,7 +520,13 @@ async def assess_loan_document(
         declared_salary=declared_salary,
         declared_applicant_name=applicant_name,
     )
-    risk_dict = scan_result["risk_assessment"]
+    risk_dict = dict(scan_result["risk_assessment"])
+    risk_dict["dob"] = scan_result.get("dob")
+    risk_dict["gender"] = scan_result.get("gender")
+    risk_dict["aadhaar_number"] = scan_result.get("aadhaar_number")
+    risk_dict["pan_identifier"] = scan_result.get("pan_identifier")
+    risk_dict["monthly_income"] = scan_result.get("monthly_income")
+    risk_dict["extracted_details"] = scan_result.get("extracted_details")
     return RiskAssessmentResponse(**risk_dict)
 
 
@@ -795,9 +840,6 @@ def copilot_chat(payload: CopilotQueryRequest):
         "What interest rates apply for Personal Loans?",
     ]
     return CopilotQueryResponse(query=payload.query, response=resp, category=cat, suggested_prompts=suggested_prompts)
-
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()

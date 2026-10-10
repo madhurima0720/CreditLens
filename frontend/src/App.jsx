@@ -116,6 +116,7 @@ export default function App() {
       case 'new-assessment':
         return (
           <AssessmentWizard
+            initialApplication={selectedApplication}
             userRole={currentUser?.roleTitle}
             onNavigateTab={(tab) => {
               if (tab === 'applications') {

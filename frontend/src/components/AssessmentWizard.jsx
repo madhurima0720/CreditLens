@@ -42,7 +42,7 @@ import AIExtractedDetailsView, { DEFAULT_EXTRACTED_DETAILS } from './AIExtracted
 
 const API = 'http://localhost:8000';
 
-export default function AssessmentWizard({ onNavigateTab, userRole }) {
+export default function AssessmentWizard({ onNavigateTab, userRole, initialApplication = null }) {
   const [currentStep, setCurrentStep] = useState(1);
   const [selectedLoanId, setSelectedLoanId] = useState('home-loan');
   const [savingToQueue, setSavingToQueue] = useState(false);
@@ -63,6 +63,30 @@ export default function AssessmentWizard({ onNavigateTab, userRole }) {
   const [bankAccountHolderName, setBankAccountHolderName] = useState('');
   const [simulateCashAnomaly, setSimulateCashAnomaly] = useState(false);
   const [simulatePdfTampering, setSimulatePdfTampering] = useState(false);
+
+  // Sync state if an application was selected from DashboardView or Queue
+  React.useEffect(() => {
+    if (initialApplication) {
+      const appName = initialApplication.applicant || initialApplication.applicant_name || '';
+      const appSal = initialApplication.salary || initialApplication.monthly_salary;
+      const appAmt = initialApplication.amount || initialApplication.requested_loan;
+      const appDetails = initialApplication.extracted_details || initialApplication.rawApp?.extracted_details;
+
+      if (appName) {
+        setFormData((prev) => ({
+          ...prev,
+          applicantName: appName,
+          ...(appSal ? { monthlySalary: String(appSal) } : {}),
+          ...(appAmt ? { requestedLoanAmount: String(appAmt) } : {})
+        }));
+        setPaySlipAccountName(appName);
+        setBankAccountHolderName(appName);
+      }
+      if (appDetails) {
+        setExtractedDetails((prev) => ({ ...prev, ...appDetails }));
+      }
+    }
+  }, [initialApplication]);
 
   const [uploadedFiles, setUploadedFiles] = useState({});
   const [uploadError, setUploadError] = useState('');
@@ -159,29 +183,76 @@ export default function AssessmentWizard({ onNavigateTab, userRole }) {
       if (res.ok) {
         const data = await res.json();
         const incomingExtracted = data.extracted_details || {};
-        if (incomingExtracted.name && incomingExtracted.name !== 'Not Found') {
-          setFormData((prev) => ({
-            ...prev,
-            applicantName: prev.applicantName || incomingExtracted.name
-          }));
-          setPaySlipAccountName((prev) => prev || incomingExtracted.name);
-          setBankAccountHolderName((prev) => prev || incomingExtracted.name);
+        const extName = (data.applicant_name || incomingExtracted.name || data.llm_analysis?.applicant_name || '').trim();
+        const extDob = (data.dob || incomingExtracted.dob || data.llm_analysis?.dob || '').trim();
+        const extGender = (data.gender || incomingExtracted.gender || data.llm_analysis?.gender || '').trim();
+        const extAadhaar = (data.aadhaar_number || incomingExtracted.aadhaar || data.llm_analysis?.aadhaar_number || '').trim();
+        const extPan = (data.pan_identifier || incomingExtracted.pan || data.llm_analysis?.pan_identifier || '').trim();
+        const extEmail = (incomingExtracted.email || '').trim();
+        const extIncomeRaw = data.monthly_income ?? data.llm_analysis?.monthly_income ?? incomingExtracted.income;
+        const extDebtRaw = data.existing_debt_emi ?? data.llm_analysis?.existing_debt_emi ?? incomingExtracted.existing_loans_emis;
+
+        let parsedIncome = null;
+        if (typeof extIncomeRaw === 'number' && extIncomeRaw > 0) {
+          parsedIncome = extIncomeRaw;
+        } else if (typeof extIncomeRaw === 'string') {
+          const numMatch = extIncomeRaw.replace(/[^\d.]/g, '');
+          if (numMatch) parsedIncome = parseFloat(numMatch);
         }
-        if (incomingExtracted.email && incomingExtracted.email !== 'Not Found') {
-          setFormData((prev) => ({
-            ...prev,
-            applicantEmail: prev.applicantEmail || incomingExtracted.email
-          }));
+
+        let parsedDebt = null;
+        if (typeof extDebtRaw === 'number' && extDebtRaw >= 0) {
+          parsedDebt = extDebtRaw;
+        } else if (typeof extDebtRaw === 'string') {
+          const numMatch = extDebtRaw.replace(/[^\d.]/g, '');
+          if (numMatch) parsedDebt = parseFloat(numMatch);
         }
+
+        // Dynamically override formData with actual OCR output instead of mock defaults
+        setFormData((prev) => {
+          const updated = { ...prev };
+          if (extName && extName !== 'Not Found') {
+            updated.applicantName = extName;
+          }
+          if (extEmail && extEmail !== 'Not Found') {
+            updated.applicantEmail = extEmail;
+          }
+          if (parsedIncome !== null && !isNaN(parsedIncome) && parsedIncome > 0) {
+            updated.monthlySalary = String(Math.round(parsedIncome));
+          }
+          if (parsedDebt !== null && !isNaN(parsedDebt) && parsedDebt > 0) {
+            updated.existingEmis = String(Math.round(parsedDebt));
+          }
+          return updated;
+        });
+
+        if (extName && extName !== 'Not Found') {
+          setPaySlipAccountName(extName);
+          setBankAccountHolderName(extName);
+        }
+
+        // Dynamically override extractedDetails state with actual OCR output
         setExtractedDetails((prev) => {
           const updated = { ...DEFAULT_EXTRACTED_DETAILS, ...prev };
           Object.entries(incomingExtracted).forEach(([k, v]) => {
-            if (v && v !== 'Not Found' && (updated[k] === 'Not Found' || !updated[k] || updated[k] === '' || updated[k] === null)) {
+            if (v && v !== 'Not Found') {
               updated[k] = v;
             }
           });
+          if (extName && extName !== 'Not Found') updated.name = extName;
+          if (extDob && extDob !== 'Not Found') updated.dob = extDob;
+          if (extGender && extGender !== 'Not Found') updated.gender = extGender;
+          if (extAadhaar && extAadhaar !== 'Not Found') updated.aadhaar = extAadhaar;
+          if (extPan && extPan !== 'Not Found') updated.pan = extPan;
+          if (parsedIncome !== null && !isNaN(parsedIncome) && parsedIncome > 0) {
+            updated.income = `₹${Number(parsedIncome).toLocaleString('en-IN')}`;
+          }
+          if (parsedDebt !== null && !isNaN(parsedDebt) && parsedDebt > 0) {
+            updated.existing_loans_emis = `₹${Number(parsedDebt).toLocaleString('en-IN')}`;
+          }
           return updated;
         });
+
         setUploadedFiles((prev) => ({
           ...prev,
           [docCode]: {

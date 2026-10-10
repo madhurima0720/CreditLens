@@ -69,6 +69,15 @@ def _extract_json_payload(text: str) -> Optional[Dict[str, Any]]:
 
 
 def extract_text_from_bytes(file_bytes: bytes, filename: str, doc_type: str = "") -> str:
+    # 1. Primary: Use unified ocr_service pipeline which dynamically configures Tesseract & handles PDF/images
+    try:
+        from app.services.ocr_service import extract_raw_text
+        text = extract_raw_text(file_bytes, filename)
+        if text and text.strip():
+            return _clean_text(text)
+    except Exception:
+        pass
+
     fn_lower = filename.lower()
     text = ""
 
@@ -102,38 +111,8 @@ def extract_text_from_bytes(file_bytes: bytes, filename: str, doc_type: str = ""
     if not text.strip():
         try:
             text = file_bytes.decode("utf-8")
-        except UnicodeDecodeError:
-            try:
-                text = file_bytes.decode("latin-1")
-            except Exception:
-                pass
-
-    if not text.strip():
-        try:
-            strings = re.findall(rb"[A-Za-z0-9\s.,:;@#\-\(\)\/\$%\+]{4,}", file_bytes)
-            text = " ".join(s.decode("latin-1", errors="ignore") for s in strings)
         except Exception:
-            pass
-
-    if not text.strip():
-        try:
-            import subprocess
-            if os.name == "nt":
-                import tempfile
-                with tempfile.NamedTemporaryFile(suffix=os.path.splitext(filename)[1] or ".png", delete=False) as tmp:
-                    tmp.write(file_bytes)
-                    tmp_path = tmp.name
-                try:
-                    text = subprocess.check_output(['tesseract', tmp_path, 'stdout'], stderr=subprocess.DEVNULL, text=True)
-                except Exception:
-                    text = ""
-                finally:
-                    try:
-                        os.unlink(tmp_path)
-                    except Exception:
-                        pass
-        except Exception:
-            pass
+            text = ""
 
     return _clean_text(text)
 
@@ -149,20 +128,46 @@ def _first_match(patterns, text: str, flags: int = 0) -> Optional[str]:
 
 def _candidate_name(text: str) -> Optional[str]:
     lines = [line.strip() for line in text.replace("\r", "\n").split("\n") if line.strip()]
+
+    # 1. Check for salary slip column layout e.g. "Employee Name ... \n : Gaurav"
+    col_match = re.search(r"employee name[\s\S]*?\n\s*:\s*([A-Za-z]{3,30})", text, re.IGNORECASE)
+    if col_match:
+        cand = col_match.group(1).strip()
+        if not any(stop in cand.lower() for stop in ["designation", "employee", "date", "joining", "associate"]):
+            return cand
+
+    # 2. Check for Aadhaar line right above 'DoB:' or 'Date of Birth'
+    for i, line in enumerate(lines):
+        if re.search(r"\bdob\b|\bdate of birth\b", line, re.IGNORECASE) and i > 0:
+            prev_line = lines[i - 1].strip()
+            clean_prev = re.sub(r"^[^A-Za-z]*[a-z]{1,3}\s+[a-z]{1,3}\s+", "", prev_line)
+            clean_prev = re.sub(r"^[^A-Za-z]+", "", clean_prev).strip()
+            if len(clean_prev) >= 3 and not any(w in clean_prev.lower() for w in ["india", "government", "authority", "uidai"]):
+                return clean_prev
+
+    # 3. Check for PAN card line right before 'Father's Name'
+    for i, line in enumerate(lines):
+        if re.search(r"father", line, re.IGNORECASE) and i > 0:
+            prev_line = lines[i - 1].strip()
+            prev_clean = re.sub(r"^[iI|\-.,:\s]+", "", prev_line).strip()
+            m = re.match(r"^([A-Z]{3,}(?:\s+[A-Z]{3,})*)", prev_clean)
+            if m and not any(w in m.group(1).lower() for w in ["card", "tax", "govt", "permanent", "india", "department", "father"]):
+                return m.group(1).strip()
+
     label_patterns = [
         "Applicant Name", "Customer Name", "Cardholder Name", "Policyholder Name",
-        "Account Holder", "Name of Applicant", "Name"
+        "Account Holder", "Name of Applicant", "Employee Name", "Name"
     ]
     for line in lines:
         for label in label_patterns:
             if line.lower().startswith(label.lower()):
                 remainder = line[len(label):].lstrip(":- ")
                 remainder = re.split(r"\s+(?:DOB|Date of Birth|D\.O\.B|Gender|Address|Mobile|Phone|PAN|Aadhaar|UID|Email)\b", remainder, flags=re.IGNORECASE)[0].strip()
-                if len(remainder) > 2 and not re.search(r"\b(statement|bank|invoice|receipt|limited|pvt|private|company|corporation)\b", remainder, re.IGNORECASE):
+                if len(remainder) > 2 and not re.search(r"\b(statement|bank|invoice|receipt|limited|pvt|private|company|corporation|father)\b", remainder, re.IGNORECASE):
                     return remainder
 
     patterns = [
-        r"(?:Applicant Name|Customer Name|Cardholder Name|Policyholder Name|Account Holder|Name of Applicant|Name)[\s:]+([A-Z][A-Za-z.\s]{2,60})(?=\s*(?:DOB|Date of Birth|D\.O\.B|Gender|Address|Mobile|Phone|PAN|Aadhaar|UID|Email|Token|$))",
+        r"(?:Applicant Name|Customer Name|Cardholder Name|Policyholder Name|Account Holder|Name of Applicant|Employee Name)[\s:]+([A-Z][A-Za-z.\s]{2,60})(?=\s*(?:DOB|Date of Birth|D\.O\.B|Gender|Address|Mobile|Phone|PAN|Aadhaar|UID|Email|Token|$))",
         r"(?:Mr\.|Ms\.|Mrs\.)\s*([A-Z][A-Za-z.\s]{2,60})(?=\s*(?:DOB|Date of Birth|D\.O\.B|Gender|Address|Mobile|Phone|PAN|Aadhaar|UID|Email|[A-Z]{2,}|$))",
         r"\b([A-Z][a-z]+(?:\s[A-Z][a-z]+){1,5})\b",
     ]
@@ -171,7 +176,7 @@ def _candidate_name(text: str) -> Optional[str]:
         if match:
             candidate = _clean_text(match.group(1))
             candidate = re.split(r"\s+(?:DOB|Date of Birth|D\.O\.B|Gender|Address|Mobile|Phone|PAN|Aadhaar|UID|Email)\b", candidate, flags=re.IGNORECASE)[0].strip()
-            if len(candidate) > 2 and not re.search(r"\b(statement|bank|invoice|receipt|limited|pvt|private|company|corporation)\b", candidate, re.IGNORECASE):
+            if len(candidate) > 2 and not re.search(r"\b(statement|bank|invoice|receipt|limited|pvt|private|company|corporation|father)\b", candidate, re.IGNORECASE):
                 return candidate
     return None
 

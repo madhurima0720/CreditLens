@@ -43,9 +43,11 @@ FINANCIAL_KEYWORDS = {
     "transaction", "transactions", "closing balance", "opening balance", "available balance",
     "ifsc", "branch", "cheque", "clearing", "holder", "account holder", "ledger",
     "passbook", "cr", "dr", "neft", "rtgs", "imps", "upi",
-    # Tax & Government Identity
+    # Tax & Government Identity / KYC
     "pan", "aadhaar", "income tax", "tax", "itr", "form 16", "assessment year", "ay", "financial year", "fy",
-    "cibil", "credit bureau", "experian", "crif",
+    "cibil", "credit bureau", "experian", "crif", "unique identification", "uidai", "identification",
+    "authority of india", "income tax department", "government of india", "govt of india", "govt", "india",
+    "permanent account number", "father's name", "date of birth", "dob",
     # Loans & Debt
     "loan", "emi", "interest", "principal", "tenure", "collateral", "asset", "liability",
     "sanction", "disbursement", "outstanding", "due date", "overdue", "mortgage", "repayment",
@@ -205,31 +207,74 @@ def find_poppler_path() -> Optional[str]:
     return None
 
 
-def preprocess_image_for_ocr(image: Image.Image) -> Image.Image:
+def preprocess_image_for_ocr(
+    image: Image.Image,
+    enhance_level: float = 1.6,
+    threshold: Optional[int] = None
+) -> Image.Image:
     """
-    Enhance document image contrast and convert to grayscale for optimal Tesseract OCR accuracy.
+    Enhance document image resolution, contrast, sharpness and convert to grayscale
+    with optional contrast thresholding using PIL for optimal Tesseract OCR accuracy
+    on Indian KYC (Aadhaar, PAN) and financial documents.
     """
     try:
+        # 1. Upscale if image is low resolution (< 1200px on either side)
+        w, h = image.size
+        if w < 1200 or h < 1200:
+            scale_factor = min(2.5, max(1.5, 1600.0 / max(w, h)))
+            new_w = int(w * scale_factor)
+            new_h = int(h * scale_factor)
+            image = image.resize((new_w, new_h), Image.Resampling.LANCZOS)
+
+        # 2. Convert to grayscale using PIL
         if image.mode != "L":
             gray = ImageOps.grayscale(image)
         else:
             gray = image
 
-        # Enhance contrast
-        enhancer = ImageEnhance.Contrast(gray)
-        enhanced = enhancer.enhance(1.4)
-        return enhanced
+        # 3. Autocontrast normalize dynamic range
+        auto_gray = ImageOps.autocontrast(gray, cutoff=1)
+
+        # 4. Enhance contrast & sharpness for text separation
+        enhancer = ImageEnhance.Contrast(auto_gray)
+        enhanced = enhancer.enhance(enhance_level)
+
+        sharpener = ImageEnhance.Sharpness(enhanced)
+        sharpened = sharpener.enhance(1.4)
+
+        # 5. Contrast thresholding using PIL point lookup if requested
+        if threshold is not None:
+            return sharpened.point(lambda p: 255 if p > threshold else 0)
+
+        return sharpened
     except Exception:
         return image
 
 
 def extract_raw_text_from_image(file_bytes: bytes) -> str:
-    """Extract raw text from an image byte stream using PIL and pytesseract."""
+    """
+    Extract raw text from an image byte stream using PIL and pytesseract.
+    Uses multi-pass preprocessing with grayscale and contrast thresholding for challenging documents (e.g., Aadhaar/PAN cards).
+    """
     configure_tesseract()
     try:
         image = Image.open(io.BytesIO(file_bytes))
-        processed = preprocess_image_for_ocr(image)
-        text = pytesseract.image_to_string(processed)
+        # Pass 1: Grayscale + contrast & sharpness enhancement
+        processed = preprocess_image_for_ocr(image, enhance_level=1.6)
+        text = pytesseract.image_to_string(processed) or ""
+
+        # Pass 2: Contrast thresholding using PIL if key markers or identity fields are missing
+        has_id_markers = any(kw in text.lower() for kw in ["income", "tax", "dob", "birth", "aadhaar", "pan", "unique", "male", "female"])
+        if len(text.strip()) < 50 or not has_id_markers:
+            try:
+                # Contrast thresholding pass at threshold 135
+                thresh_img = preprocess_image_for_ocr(image, enhance_level=2.0, threshold=135)
+                alt_text = pytesseract.image_to_string(thresh_img) or ""
+                if len(alt_text.strip()) > len(text.strip()):
+                    text = alt_text
+            except Exception:
+                pass
+
         return text or ""
     except Exception as exc:
         logger.error("Failed to extract text from image with Tesseract: %s", exc)
@@ -356,6 +401,14 @@ def validate_and_classify_financial_document(
         pattern = r"\b" + re.escape(kw) + r"\b"
         if re.search(pattern, text_lower):
             matched_keywords.append(kw)
+
+    # Check for PAN identifier pattern (e.g. QFVPS0764H)
+    if re.search(r"\b[A-Z]{5}[0-9]{4}[A-Z]\b", cleaned):
+        matched_keywords.append("pan_format")
+
+    # Check for 12-digit Aadhaar pattern
+    if re.search(r"\b([0-9]{4}\s[0-9]{4}\s[0-9]{4})\b", cleaned):
+        matched_keywords.append("aadhaar_format")
 
     matched_count = len(matched_keywords)
 
